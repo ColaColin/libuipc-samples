@@ -64,6 +64,26 @@ VERIFY = "--verify" in sys.argv
 _positional = [a for a in sys.argv[1:] if not a.startswith("--")]
 N_FRAMES = int(_positional[0]) if _positional else 180
 
+# --- validation-pass knobs (round 6 / V1).  All three default to a value that
+# makes the code below take *exactly* the branch it took before they existed,
+# so the default scene -- the round's instrument -- stays byte-stable and the
+# manifest's comparability note still holds. -----------------------------------
+#
+#   --perturb-yaw=<rad>     add a rotation to ONE garment's initial yaw
+#   --perturb-vertex=<m>    add an offset to ONE vertex's initial x coordinate
+#   --perturb-garment=<i>   which garment (0=towel, 1=pillowcase, 2=shorts,
+#                           3=washcloth); only read when a perturbation is set
+#
+# These exist to build the *perturbed-exact control arm*: a physically
+# meaningless change of the initial state that breaks the bitwise path, so that
+# "how far do two physically equivalent runs of this system drift apart on
+# their own" becomes measurable and can be compared against the drift caused by
+# a change of the solver's search direction.
+PERTURB_YAW = _opt("perturb-yaw", 0.0)          # radians
+PERTURB_VERTEX = _opt("perturb-vertex", 0.0)    # metres
+PERTURB_GARMENT = _opt("perturb-garment", 0, int)
+DUMP_POSITIONS = _opt("dump-positions", "", str)  # float64 .npy per frame stack
+
 # --- scene constants (fixed: the benchmark's comparability depends on them) --
 DT = 1.0 / 60.0
 RPM = 40.0                       # ~5.3 m/s^2 centripetal at the bore: tumbling,
@@ -125,10 +145,15 @@ GARMENTS = [
 ]
 
 built = []
-for name, builder, yaw, y in GARMENTS:
+for _gi, (name, builder, yaw, y) in enumerate(GARMENTS):
     V, F = builder(EDGE_LEN)
     st = G.mesh_stats(V, F)
+    if PERTURB_YAW != 0.0 and _gi == PERTURB_GARMENT:
+        yaw = yaw + math.degrees(PERTURB_YAW)
     Vw = G.lay_flat(V, yaw, (0.0, y, 0.0))
+    if PERTURB_VERTEX != 0.0 and _gi == PERTURB_GARMENT:
+        Vw = Vw.copy()
+        Vw[0, 0] += PERTURB_VERTEX
     reason = G.fits_in_bore(Vw, spec, clearance=0.008)
     if reason is not None:
         raise SystemExit(f"{name} does not fit in the drum bore: {reason}")
@@ -237,6 +262,11 @@ if HEADLESS:
           f"(drum {len(drum_F)}), edge_len={EDGE_LEN * 1e3:.1f}mm, "
           f"h_min={MIN_TRI_HEIGHT * 1e3:.2f}mm, r={CLOTH_R * 1e3:.2f}mm, "
           f"d_hat={D_HAT * 1e3:.2f}mm, {RPM:g}rpm, {N_FRAMES} frames", flush=True)
+    if PERTURB_YAW != 0.0 or PERTURB_VERTEX != 0.0:
+        print(f"PERTURBED garment={PERTURB_GARMENT} "
+              f"yaw={PERTURB_YAW:.3e}rad vertex_dx={PERTURB_VERTEX:.3e}m", flush=True)
+    else:
+        print("PERTURBED none (default scene)", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -262,12 +292,15 @@ if HEADLESS:
 
     frame_ms = []
     frame_stats = []
+    traj = [np.vstack(cloth_positions()).astype(np.float64)] if DUMP_POSITIONS else None
     for _ in range(N_FRAMES):
         t0 = time.perf_counter()
         world.advance()
         world.retrieve()
         frame_ms.append((time.perf_counter() - t0) * 1e3)
         frame_stats.append(snapshot_frame_stats(engine))
+        if traj is not None:
+            traj.append(np.vstack(cloth_positions()).astype(np.float64))
         if audit is not None:
             audit.observe(world.frame(), cloth_positions(), drum_angle(),
                           frame_stats[-1])
@@ -290,6 +323,9 @@ if HEADLESS:
     }
     if audit is not None:
         observables.update(audit.summary())
+    if traj is not None:
+        np.save(DUMP_POSITIONS, np.stack(traj))
+        print(f"POSITIONS_DUMP {DUMP_POSITIONS} shape={np.stack(traj).shape}", flush=True)
     emit_benchmark_result(frame_ms, frame_stats, observables=observables)
     if audit is not None:
         audit.report()
