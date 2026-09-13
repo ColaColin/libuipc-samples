@@ -50,6 +50,21 @@ class Audit:
         self.F = [np.asarray(g["F"], dtype=np.int64).reshape(-1, 3) for g in built]
         self.rest_area = [self._areas(np.asarray(g["V_rest"]), f)
                           for g, f in zip(built, self.F)]
+        # lumped vertex mass, in units of areal density: one third of the rest
+        # area of each incident triangle.  Only ratios and A/B differences are
+        # read off it, so the constant areal density is left out on purpose.
+        self.vmass = []
+        for g, f, a0 in zip(built, self.F, self.rest_area):
+            m = np.zeros(len(np.asarray(g["V_rest"])), dtype=np.float64)
+            for k in range(3):
+                np.add.at(m, f[:, k], a0 / 3.0)
+            self.vmass.append(m)
+        self.mass_all = np.concatenate(self.vmass)
+        # vertices that share a triangle are *supposed* to be close; exclude
+        # them from the cloth-cloth proximity statistic.
+        self.nbr_keys = self._neighbour_keys(
+            built, self.F, int(sum(len(np.asarray(g["V_rest"])) for g in built)))
+        self.n_seg = getattr(spec, "n_seg", 48)
         self.prev = None
         self.rows = []
         self.turn = [0.0] * len(built)     # unwrapped centroid angle travel
@@ -57,6 +72,52 @@ class Audit:
         self.gpu_mib = 0
 
     # -- helpers ------------------------------------------------------------
+    @staticmethod
+    def _neighbour_keys(built, Fs, n_total):
+        """Sorted int64 keys i*n+j for every ordered vertex pair that shares a
+        triangle (plus i==i), over the concatenated garment vertex block."""
+        off, pairs = 0, []
+        for g, F in zip(built, Fs):
+            n = len(np.asarray(g["V_rest"]))
+            T = F + off
+            a = np.repeat(T, 3, axis=1).reshape(-1)          # i
+            b = np.tile(T, (1, 3)).reshape(-1)               # j
+            pairs.append(a.astype(np.int64) * n_total + b.astype(np.int64))
+            off += n
+        idx = np.arange(n_total, dtype=np.int64)
+        pairs.append(idx * n_total + idx)
+        return np.unique(np.concatenate(pairs))
+
+    def _cloth_cloth_min_dist(self, P):
+        """Smallest distance between two cloth vertices that do not share a
+        triangle.  A *proxy* for the true point-triangle gap -- it bounds it
+        from above -- but it is the same proxy in every arm, which is what the
+        A/B needs.  Returns inf if scipy is unavailable."""
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:
+            return float("inf")
+        n = P.shape[0]
+        tree = cKDTree(P)
+        d, j = tree.query(P, k=12, workers=-1)
+        i = np.repeat(np.arange(n, dtype=np.int64)[:, None], d.shape[1], axis=1)
+        keys = i * n + j.astype(np.int64)
+        excluded = np.isin(keys.reshape(-1), self.nbr_keys).reshape(d.shape)
+        dd = np.where(excluded | ~np.isfinite(d), np.inf, d)
+        return float(dd.min())
+
+    def _bore_gap_min(self, P):
+        """Signed distance from every cloth vertex to the *polygonal* bore wall
+        (n_seg flats at circumradius R), positive inside.  Exact for the tube;
+        the lifters are covered by `lifter_depth`."""
+        n = self.n_seg
+        R = self.spec.radius
+        r = np.hypot(P[:, 0], P[:, 1])
+        th = np.arctan2(P[:, 1], P[:, 0])
+        step = 2.0 * math.pi / n
+        phi = np.remainder(th + step / 2.0, step) - step / 2.0
+        return float((R * math.cos(step / 2.0) - r * np.cos(phi)).min())
+
     @staticmethod
     def _areas(V, F):
         a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
@@ -113,15 +174,24 @@ class Audit:
         row["area_ratio_min"] = ratio_lo
         row["area_ratio_max"] = ratio_hi
         row["tri_height_min"] = h_min
+        row["cc_min_dist"] = self._cloth_cloth_min_dist(P)
+        row["bore_gap_min"] = self._bore_gap_min(P)
+        # energy, in units of areal density (see self.vmass): gravitational
+        # potential now, kinetic from the finite-difference velocity below.
+        row["pe_grav"] = float(9.8 * np.dot(self.mass_all, P[:, 1]))
 
         # motion: mean vertex speed and centroid angular travel about the axis
         if self.prev is not None:
+            dv = (P - self.prev) / self.dt
             d = np.linalg.norm(P - self.prev, axis=1)
             row["mean_disp"] = float(d.mean())
             row["max_speed"] = float(d.max() / self.dt)
+            row["ke"] = float(0.5 * np.dot(self.mass_all, (dv * dv).sum(axis=1)))
         else:
             row["mean_disp"] = 0.0
             row["max_speed"] = 0.0
+            row["ke"] = 0.0
+        row["e_tot"] = row["ke"] + row["pe_grav"]
         phi = np.array([math.atan2(V[:, 1].mean(), V[:, 0].mean()) for V in positions])
         if self.last_phi is not None:
             dphi = np.remainder(phi - self.last_phi + math.pi, 2 * math.pi) - math.pi
@@ -136,6 +206,11 @@ class Audit:
             row["pcg"] = int(stats.get("linear_solver_iterations", -1))
             row["line_search"] = int(stats.get("line_search_trials", -1))
             row["converged"] = int(stats.get("converged", -1))
+            row["hit_newton_limit"] = int(bool(stats.get("hit_newton_limit", 0)))
+            row["hit_ls_limit"] = int(bool(stats.get("hit_line_search_limit", 0)))
+            row["last_ccd_toi"] = float(stats.get("last_ccd_toi", 1.0))
+            row["last_ls_alpha"] = float(stats.get("last_line_search_alpha", 1.0))
+            row["last_cfl_alpha"] = float(stats.get("last_cfl_alpha", 1.0))
         self.rows.append(row)
 
     # -- summary ------------------------------------------------------------
@@ -180,6 +255,27 @@ class Audit:
             "verify_pcg_first_quarter": float(pcg[:half].mean()),
             "verify_pcg_last_quarter": float(pcg[-half:].mean()),
             "verify_gpu_mem_proc_max_mib": int(self.gpu_mib),
+            "verify_cc_min_dist": min(x["cc_min_dist"] for x in rows),
+            "verify_bore_gap_min": min(x["bore_gap_min"] for x in rows),
+            "verify_ke_mean": float(np.mean([x["ke"] for x in run])),
+            "verify_ke_max": float(max(x["ke"] for x in rows)),
+            "verify_e_tot_first": float(rows[1]["e_tot"]) if len(rows) > 1 else 0.0,
+            "verify_e_tot_last": float(rows[-1]["e_tot"]),
+            "verify_e_tot_max": float(max(x["e_tot"] for x in rows)),
+            "verify_ccd_toi_min": float(min(x.get("last_ccd_toi", 1.0) for x in run)),
+            "verify_ccd_toi_clamped_frames": int(
+                sum(1 for x in run if x.get("last_ccd_toi", 1.0) < 1.0)),
+            "verify_ls_alpha_min": float(min(x.get("last_ls_alpha", 1.0) for x in run)),
+            "verify_ls_alpha_cut_frames": int(
+                sum(1 for x in run if x.get("last_ls_alpha", 1.0) < 1.0)),
+            "verify_cfl_alpha_min": float(min(x.get("last_cfl_alpha", 1.0) for x in run)),
+            "verify_hit_newton_limit_frames": int(
+                sum(x.get("hit_newton_limit", 0) for x in run)),
+            "verify_hit_ls_limit_frames": int(sum(x.get("hit_ls_limit", 0) for x in run)),
+            "verify_line_search_total": int(
+                sum(x.get("line_search", 0) for x in run)),
+            "verify_newton_total": int(newton.sum()),
+            "verify_pcg_total": int(pcg.sum()),
             "verify_not_converged_frames": int(sum(1 for x in run if x.get("converged", 1) == 0)),
         }
         out["verify_ok"] = bool(
