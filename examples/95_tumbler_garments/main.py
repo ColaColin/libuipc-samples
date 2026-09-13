@@ -114,6 +114,11 @@ DRUM_KAPPA = 1.0e8
 DRUM_DENSITY = _opt("drum-density", 5.0e2)
 MOTOR_STRENGTH = _opt("motor-strength", 1.0e2)
 TOL_RATE = _opt("tol-rate", 1e-3)
+# V1 validation knob: the Newton stopping tolerance.  Default unchanged, so the
+# benchmark scene is untouched; a tighter value is how "is the arm-to-arm
+# difference a truncation bias or chaos?" is decided -- a truncation bias must
+# shrink when both arms converge harder, chaotic divergence must not.
+VEL_TOL = _opt("vel-tol", 0.05)
 
 configure_benchmark_timers()
 Logger.set_level(getattr(Logger.Level, os.environ.get("WB_LOG", "Warn")))
@@ -178,7 +183,7 @@ config["gravity"] = [[0.0], [-9.8], [0.0]]
 config["contact"]["enable"] = True
 config["contact"]["friction"]["enable"] = True
 config["contact"]["d_hat"] = D_HAT
-config["newton"]["velocity_tol"] = 0.05
+config["newton"]["velocity_tol"] = VEL_TOL
 config["linear_system"]["tol_rate"] = TOL_RATE
 config["linear_system"]["fem_preconditioner"] = "mas"
 scene = Scene(config)
