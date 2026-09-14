@@ -53,12 +53,19 @@ config = Scene.default_config()
 config["dt"] = 0.01
 config["gravity"] = [[0.0], [-9.8], [0.0]]
 config["contact"]["d_hat_relative"] = 1e-3
-config["newton"]["velocity_tol_relative"] = 1e-2
+# round-6 V2 validation knob, opt-in and default-neutral: UIPC_CWC_TIGHT=<k>
+# divides BOTH Newton stopping tolerances by k, so "is an arm-to-arm difference a
+# truncation bias or a change of the converged solution?" becomes measurable --
+# a truncation bias must shrink when both arms converge harder, a change of the
+# solved equations must not.  k defaults to 1, which leaves every literal below
+# exactly as it was, so the benchmark scene stays byte-stable.
+_TIGHT = float(os.environ.get("UIPC_CWC_TIGHT", "1") or "1")
+config["newton"]["velocity_tol_relative"] = 1e-2 / _TIGHT
 config["contact"]["eps_velocity_relative"] = 1e-2
 config["linear_system"]["tol_rate"] = 1e-4
 config["newton"]["transrate_tol"] = 10
 config["newton"]["semi_implicit"]["enable"] = 1
-config["newton"]["semi_implicit"]["beta_tol"] = 1e-2
+config["newton"]["semi_implicit"]["beta_tol"] = 1e-2 / _TIGHT
 config["newton"]["semi_implicit"]["K_min"] = 6
 # Stiff P_type=1 -> MAS
 config["linear_system"]["fem_preconditioner"] = "mas"
