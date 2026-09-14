@@ -165,14 +165,42 @@ class Audit:
             "y_min": float(P[:, 1].min()),
             "y_max": float(P[:, 1].max()),
         }
+        # round-6 V2: `area_ratio_max` is a max over ~19 900 triangles and then
+        # over 180 frames -- a double extreme value, and the round's most
+        # over-read statistic.  The *distribution* behind it is what says
+        # whether the membrane is stretched further or whether one triangle in
+        # one frame hit a transient, so the quantiles, the threshold counts and
+        # the bulk (total-area) stretch are recorded per frame alongside it.
+        # Audit only: nothing here is read by the simulation.
         ratio_lo, ratio_hi, h_min = math.inf, 0.0, math.inf
-        for V, F, A0 in zip(positions, self.F, self.rest_area):
+        g_arg, t_arg = -1, -1
+        ratios, area_now, area_rest = [], 0.0, 0.0
+        for gi, (V, F, A0) in enumerate(zip(positions, self.F, self.rest_area)):
             A = self._areas(V, F)
-            ratio_lo = min(ratio_lo, float((A / A0).min()))
-            ratio_hi = max(ratio_hi, float((A / A0).max()))
+            R = A / A0
+            ratio_lo = min(ratio_lo, float(R.min()))
+            k = int(np.argmax(R))
+            if float(R[k]) > ratio_hi:
+                ratio_hi, g_arg, t_arg = float(R[k]), gi, k
             h_min = min(h_min, self._min_height(V, F))
+            ratios.append(R)
+            area_now += float(A.sum())
+            area_rest += float(A0.sum())
+        allR = np.concatenate(ratios)
+        q = np.quantile(allR, [0.5, 0.99, 0.999])
         row["area_ratio_min"] = ratio_lo
         row["area_ratio_max"] = ratio_hi
+        row["ar_argmax_garment"] = g_arg
+        row["ar_argmax_tri"] = t_arg
+        row["ar_q50"] = float(q[0])
+        row["ar_q99"] = float(q[1])
+        row["ar_q999"] = float(q[2])
+        row["ar_mean"] = float(allR.mean())
+        row["ar_total"] = area_now / area_rest
+        row["ar_n_gt_1p2"] = int((allR > 1.2).sum())
+        row["ar_n_gt_1p4"] = int((allR > 1.4).sum())
+        row["ar_n_gt_1p6"] = int((allR > 1.6).sum())
+        row["n_tri"] = int(allR.size)
         row["tri_height_min"] = h_min
         row["cc_min_dist"] = self._cloth_cloth_min_dist(P)
         row["bore_gap_min"] = self._bore_gap_min(P)
@@ -236,6 +264,23 @@ class Audit:
             "verify_lifter_depth_max": max(x["lifter_depth"] for x in rows),
             "verify_area_ratio_min": min(x["area_ratio_min"] for x in rows),
             "verify_area_ratio_max": max(x["area_ratio_max"] for x in rows),
+            # round-6 V2: the distribution behind `verify_area_ratio_max`.
+            "verify_ar_argmax_frame": int(
+                max(rows, key=lambda x: x["area_ratio_max"])["frame"]),
+            "verify_ar_argmax_garment": int(
+                max(rows, key=lambda x: x["area_ratio_max"])["ar_argmax_garment"]),
+            "verify_ar_q999_max": float(max(x["ar_q999"] for x in rows)),
+            "verify_ar_q999_mean": float(np.mean([x["ar_q999"] for x in rows])),
+            "verify_ar_q99_max": float(max(x["ar_q99"] for x in rows)),
+            "verify_ar_q99_mean": float(np.mean([x["ar_q99"] for x in rows])),
+            "verify_ar_mean_mean": float(np.mean([x["ar_mean"] for x in rows])),
+            "verify_ar_total_max": float(max(x["ar_total"] for x in rows)),
+            "verify_ar_total_mean": float(np.mean([x["ar_total"] for x in rows])),
+            "verify_ar_n_gt_1p2_total": int(sum(x["ar_n_gt_1p2"] for x in rows)),
+            "verify_ar_n_gt_1p4_total": int(sum(x["ar_n_gt_1p4"] for x in rows)),
+            "verify_ar_n_gt_1p6_total": int(sum(x["ar_n_gt_1p6"] for x in rows)),
+            "verify_ar_frames_gt_1p4": int(
+                sum(1 for x in rows if x["area_ratio_max"] > 1.4)),
             "verify_tri_height_min": min(x["tri_height_min"] for x in rows),
             "verify_max_speed": max(x["max_speed"] for x in rows),
             "verify_drum_track_err_deg_max": float(np.max(np.abs(err))),
