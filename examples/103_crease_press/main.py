@@ -153,6 +153,25 @@ ap.add_argument("--carton-edge", type=float, default=0.0155,
                 help="target cardboard/metal element size (m)")
 ap.add_argument("--verify", action="store_true",
                 help="run the physical-soundness + constitution-state audit")
+# --- validation-pass knobs (round 7 / s05).  All three default to a value that
+# makes the code below take *exactly* the branch it took before they existed,
+# so the default scene -- the round's instrument -- stays byte-stable (proved
+# bitwise on the constructed rest positions; see the s05 evidence).
+#   --perturb-yaw=<rad>     rotate ONE sheet's initial rest pose about its own
+#                           centre (y axis) -- physically meaningless at 1e-5 rad
+#   --perturb-vertex=<m>    offset ONE free (unclamped) vertex's initial y
+#   --perturb-sheet=<i>     which sheet (0-6, 0=bottom denim); only read when a
+#                           perturbation is set
+# These build the *matched-perturbation control arm*: two runs of the exact
+# same physics that differ by a known initial-state seed, so "how far do
+# physically equivalent runs drift apart on their own" is measurable against
+# the drift caused by the dahl Gauss-Newton search direction (round-6 V1
+# methodology).
+ap.add_argument("--perturb-yaw", type=float, default=0.0)
+ap.add_argument("--perturb-vertex", type=float, default=0.0)
+ap.add_argument("--perturb-sheet", type=int, default=0)
+ap.add_argument("--dump-positions", default="",
+                help="write per-frame stacked sheet positions as a float64 .npy")
 args = ap.parse_args()
 r6.configure_benchmark_timers()
 Logger.set_level(getattr(Logger.Level, os.environ.get("WB_LOG", "Error")))
@@ -274,6 +293,17 @@ for k, (name, kind) in enumerate(STACK):
         rx, rz, V0, F = carton_rx, carton_rz, carton_V, carton_F
     V = V0.copy()
     V[:, 1] = STACK_Y0 + k * GAP
+    # s05 validation knobs -- both branches are guarded by a != 0.0 test on a
+    # flag whose default is exactly 0.0, so the default construction is
+    # bit-for-bit the pre-s05 code path.
+    if args.perturb_yaw != 0.0 and k == args.perturb_sheet:
+        c_, s_ = math.cos(args.perturb_yaw), math.sin(args.perturb_yaw)
+        x_, z_ = V[:, 0].copy(), V[:, 2].copy()
+        V[:, 0] = c_ * x_ - s_ * z_
+        V[:, 2] = s_ * x_ + c_ * z_
+    if args.perturb_vertex != 0.0 and k == args.perturb_sheet:
+        free = np.flatnonzero(np.abs(V0[:, 2]) <= 0.5 * SHEET_Z - 1e-9)
+        V[int(free[0]), 1] += args.perturb_vertex
     mesh = trimesh(np.ascontiguousarray(V), np.ascontiguousarray(F, dtype=np.int32))
     label_surface(mesh)
     if denim:
@@ -419,6 +449,18 @@ if args.verify:
     audit.observe(0, [np.asarray(s["slot"].geometry().positions().view()).reshape(-1, 3)
                       for s in SHEETS], press_pose(0), None)
 
+if args.perturb_yaw != 0.0 or args.perturb_vertex != 0.0:
+    print(f"PERTURB sheet={args.perturb_sheet} yaw={args.perturb_yaw:.3e}rad "
+          f"vertex_dy={args.perturb_vertex:.3e}m", flush=True)
+
+
+def sheet_positions():
+    return np.vstack([np.asarray(s["slot"].geometry().positions().view()).reshape(-1, 3)
+                      for s in SHEETS]).astype(np.float64)
+
+
+traj = [sheet_positions()] if args.dump_positions else None
+
 
 def measure():
     return {"frame": world.frame(), "phase": phase(world.frame() - 1),
@@ -429,6 +471,8 @@ def measure():
 capture.write_frame(0, force=True)
 for i in range(N):
     ms = runner.step(on_frame=measure)
+    if traj is not None:
+        traj.append(sheet_positions())
     if audit is not None:
         audit.observe(world.frame(),
                       [np.asarray(s["slot"].geometry().positions().view()).reshape(-1, 3)
@@ -450,6 +494,9 @@ for i in range(N):
 
 final_sanity = r6.run_sanity_check(world) if not args.no_sanity else {"skipped": True}
 capture.finish(runner.frame_ms)
+if traj is not None:
+    np.save(args.dump_positions, np.stack(traj))
+    print(f"POSITIONS_DUMP {args.dump_positions} shape={np.stack(traj).shape}", flush=True)
 
 # --- observables -------------------------------------------------------------
 last_press_y, last_press_z = press_pose(N)
